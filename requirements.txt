@@ -1,0 +1,7 @@
+numpy>=1.21
+nibabel>=3.2
+matplotlib>=3.5
+scikit-image>=0.19
+tqdm>=4.60
+torch>=2.0
+monai>=1.2

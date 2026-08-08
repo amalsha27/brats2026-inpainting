@@ -1,0 +1,206 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: brats-viz-augmentation-v4
+  namespace: gai-lina-group
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: viz
+          image: python:3.10-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              pip install -q nibabel numpy matplotlib
+
+              python3 << 'PYEOF'
+              import os, json
+              import numpy as np
+              import nibabel as nib
+              import matplotlib
+              matplotlib.use('Agg')
+              import matplotlib.pyplot as plt
+              import matplotlib.patches as mpatches
+
+              DATA_ROOT = '/data/brats2023/training'
+              VAL_JSON  = '/data/experiments/improved/val_samples.json'
+              OUT_DIR   = '/data/experiments/figures'
+              os.makedirs(OUT_DIR, exist_ok=True)
+
+              # ── Synthetic ellipsoid generator ─────────────────────────────────────
+              def generate_ellipsoid_at(center, brain_mask, semi_axes, angle=0.0):
+                  H, W, D = brain_mask.shape
+                  cx, cy, cz = int(center[0]), int(center[1]), int(center[2])
+                  rx, ry, rz = semi_axes
+
+                  xs = np.arange(max(0, cx-rx-5), min(H, cx+rx+5))
+                  ys = np.arange(max(0, cy-ry-5), min(W, cy+ry+5))
+                  zs = np.arange(max(0, cz-rz-5), min(D, cz+rz+5))
+                  if len(xs) == 0 or len(ys) == 0 or len(zs) == 0:
+                      return np.zeros_like(brain_mask, dtype=np.float32)
+
+                  xx, yy, zz = np.meshgrid(xs, ys, zs, indexing='ij')
+                  cos_a, sin_a = np.cos(angle), np.sin(angle)
+                  dx = xx - cx; dy = yy - cy; dz = zz - cz
+                  dx_r = cos_a * dx - sin_a * dy
+                  dy_r = sin_a * dx + cos_a * dy
+
+                  inside = (dx_r/rx)**2 + (dy_r/ry)**2 + (dz/rz)**2 <= 1.0
+
+                  # FIX: fancy indexing returns a copy — fill local sub-array then assign back
+                  sub = np.zeros((len(xs), len(ys), len(zs)), dtype=np.float32)
+                  sub[inside] = 1.0
+                  synth = np.zeros_like(brain_mask, dtype=np.float32)
+                  synth[xs[:, None, None], ys[None, :, None], zs[None, None, :]] = sub
+
+                  # Clip to brain region (void region included via caller's brain_mask)
+                  return synth * brain_mask.astype(np.float32)
+
+              def generate_synth_mask(real_mask, brain_mask, n_ellipsoids, rng):
+                  """Generate synthetic void centered near real mask centroid."""
+                  coords = np.argwhere(real_mask > 0.5)
+                  if len(coords) == 0:
+                      return np.zeros_like(brain_mask, dtype=np.float32)
+                  center = coords.mean(axis=0).astype(int)  # (cx, cy, cz)
+
+                  result = np.zeros_like(brain_mask, dtype=np.float32)
+                  for i in range(n_ellipsoids):
+                      jitter = rng.integers(-20, 21, size=3) if i > 0 else np.zeros(3, dtype=int)
+                      cx = int(np.clip(center[0] + jitter[0], 0, brain_mask.shape[0]-1))
+                      cy = int(np.clip(center[1] + jitter[1], 0, brain_mask.shape[1]-1))
+                      cz = int(np.clip(center[2] + jitter[2], 0, brain_mask.shape[2]-1))
+                      rx = int(rng.integers(15, 40))
+                      ry = int(rng.integers(15, 40))
+                      rz = int(rng.integers(10, 30))
+                      angle = float(rng.uniform(-0.4, 0.4))
+                      print(f"    ellipsoid center=({cx},{cy},{cz}) r=({rx},{ry},{rz})")
+                      e = generate_ellipsoid_at((cx, cy, cz), brain_mask, (rx, ry, rz), angle)
+                      print(f"    ellipsoid 3D voxels: {int(e.sum())}")
+                      result = np.clip(result + e, 0, 1)
+                  return result
+
+              # ── Load val cases and pick small / medium / large ───────────────────
+              with open(VAL_JSON) as f:
+                  val_cases = json.load(f)['val_samples']
+
+              cases_info = []
+              for case in val_cases:
+                  mask_path = os.path.join(DATA_ROOT, case, f'{case}-mask.nii.gz')
+                  t1n_path  = os.path.join(DATA_ROOT, case, f'{case}-t1n.nii.gz')
+                  if not os.path.exists(mask_path) or not os.path.exists(t1n_path):
+                      continue
+                  mask = nib.load(mask_path).get_fdata(dtype=np.float32)
+                  cases_info.append((case, int(mask.sum()), t1n_path, mask_path))
+
+              cases_info.sort(key=lambda x: x[1])
+              N = len(cases_info)
+              picks = [cases_info[N//6], cases_info[N//2], cases_info[5*N//6]]
+              print(f"Cases: {[p[0] for p in picks]}, void sizes: {[p[1] for p in picks]}")
+
+              # ── Figure ────────────────────────────────────────────────────────────
+              col_labels = ['T1n Brain Slice', 'Real Tumor Mask',
+                            'Synth-Aug Void\n(1 ellipsoid)', 'Synth-Aug Void\n(1–3 ellipsoids)']
+              row_labels = ['Small void', 'Medium void', 'Large void']
+
+              fig, axes = plt.subplots(3, 4, figsize=(12.0, 9.5), dpi=200)
+              fig.patch.set_facecolor('white')
+
+              for col_idx, label in enumerate(col_labels):
+                  axes[0, col_idx].set_title(label, fontsize=10, fontweight='bold', pad=7)
+
+              for row_idx, (case, void_size, t1n_path, mask_path) in enumerate(picks):
+                  t1n  = nib.load(t1n_path).get_fdata(dtype=np.float32)
+                  mask = nib.load(mask_path).get_fdata(dtype=np.float32)
+
+                  # Include void region in brain mask so ellipsoids aren't erased there
+                  brain = (t1n > 0) | (mask > 0.5)
+                  brain_vox = t1n[t1n > 0]
+                  lo, hi = np.percentile(brain_vox, 1), np.percentile(brain_vox, 99)
+                  t1n_norm = np.clip((t1n - lo) / (hi - lo + 1e-8), 0, 1)
+
+                  # Best axial slice = most real mask voxels
+                  sl = int(np.argmax(mask.sum(axis=(0, 1))))
+
+                  rng1 = np.random.default_rng(7)
+                  rng2 = np.random.default_rng(42)
+                  print(f"\nRow {row_idx} ({case}), sl={sl}")
+                  print("  --- synth1 ---")
+                  synth1 = generate_synth_mask(mask, brain, n_ellipsoids=1, rng=rng1)
+                  n_ell  = int(rng2.integers(2, 4))
+                  print(f"  --- synth3 (n={n_ell}) ---")
+                  synth3 = generate_synth_mask(mask, brain, n_ellipsoids=n_ell, rng=rng2)
+                  print(f"  synth1@sl={int(synth1[:,:,sl].sum())}  synth3@sl={int(synth3[:,:,sl].sum())}")
+
+                  def best_overlay_slice(mask_vol, preferred_sl):
+                      """Use preferred slice if it has overlay voxels, else find best slice."""
+                      if mask_vol[:,:,preferred_sl].sum() > 0:
+                          return preferred_sl
+                      # Fallback: slice with most synth voxels
+                      return int(np.argmax(mask_vol.sum(axis=(0, 1))))
+
+                  def show_overlay(ax, brain_img, mask_vol, color, force_sl=None):
+                      use_sl = force_sl if force_sl is not None else best_overlay_slice(mask_vol, sl)
+                      brain_sl = np.rot90(brain_img[:, :, use_sl])
+                      mask_sl  = np.rot90(mask_vol[:, :, use_sl])
+                      ax.imshow(brain_sl, cmap='gray', vmin=0, vmax=1, interpolation='bilinear')
+                      if mask_sl.sum() > 0:
+                          overlay = np.zeros((*brain_sl.shape, 4))
+                          overlay[mask_sl > 0.5] = color
+                          ax.imshow(overlay, interpolation='nearest')
+                      ax.set_xticks([]); ax.set_yticks([])
+                      for sp in ax.spines.values():
+                          sp.set_visible(False)
+
+                  # Col 0: plain brain
+                  axes[row_idx, 0].imshow(np.rot90(t1n_norm[:, :, sl]),
+                                          cmap='gray', vmin=0, vmax=1, interpolation='bilinear')
+                  axes[row_idx, 0].set_xticks([]); axes[row_idx, 0].set_yticks([])
+                  for sp in axes[row_idx, 0].spines.values():
+                      sp.set_visible(False)
+
+                  # Col 1: real tumor mask (red) — force same slice
+                  show_overlay(axes[row_idx, 1], t1n_norm, mask,   [1.0, 0.15, 0.15, 0.65], force_sl=sl)
+                  # Col 2: synth 1 ellipsoid (blue)
+                  show_overlay(axes[row_idx, 2], t1n_norm, synth1, [0.1, 0.5, 1.0, 0.65])
+                  # Col 3: synth 1-3 ellipsoids (blue)
+                  show_overlay(axes[row_idx, 3], t1n_norm, synth3, [0.1, 0.5, 1.0, 0.65])
+
+                  axes[row_idx, 0].set_ylabel(
+                      f'{row_labels[row_idx]}\n({void_size:,} vox)',
+                      fontsize=9, labelpad=5)
+
+              # Legend
+              real_p  = mpatches.Patch(color=(1.0, 0.15, 0.15, 0.8), label='Real tumor mask (irregular)')
+              synth_p = mpatches.Patch(color=(0.1, 0.5, 1.0, 0.8),  label='Synthetic ellipsoid void (Synth-Aug)')
+              fig.legend(handles=[real_p, synth_p], loc='lower center', ncol=2,
+                         fontsize=9, bbox_to_anchor=(0.5, -0.01),
+                         frameon=True, edgecolor='gray')
+
+              plt.suptitle('Synthetic Void Augmentation: Real Tumor Masks vs Synthetic Ellipsoidal Voids',
+                           fontsize=11, fontweight='bold', y=1.01)
+              plt.tight_layout(pad=0.6, h_pad=0.5, w_pad=0.4)
+
+              out = os.path.join(OUT_DIR, 'augmentation_comparison.png')
+              plt.savefig(out, dpi=200, bbox_inches='tight', facecolor='white')
+              print(f"\nSaved → {out}")
+              PYEOF
+              echo "=== Done ==="
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "1"
+            limits:
+              memory: "4800Mi"
+              cpu: "1200m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: brats-inpainting-pvc

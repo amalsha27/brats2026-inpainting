@@ -1,0 +1,159 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: brats-stratification-v2
+  namespace: gai-lina-group
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: strat
+          image: python:3.10-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              pip install -q nibabel numpy
+
+              python3 << 'PYEOF'
+              import os, json, csv
+              import numpy as np
+              import nibabel as nib
+
+              DATA_ROOT = '/data/brats2023/training'
+              VAL_JSON  = '/data/experiments/improved/val_samples.json'
+              IMP_CSV   = '/data/experiments/improved/eval/per_sample.csv'
+              SYN_CSV   = '/data/experiments/synth-aug/eval/per_sample.csv'
+              OUT_DIR   = '/data/experiments/figures'
+              os.makedirs(OUT_DIR, exist_ok=True)
+
+              # Load val cases directly from CSV (not val_samples.json — avoids split mismatch)
+              with open(IMP_CSV) as f:
+                  val_cases = [r['sample'] for r in csv.DictReader(f)]
+              print(f"Val cases from CSV: {len(val_cases)}")
+
+              # Load per-sample metrics
+              def load_csv(path):
+                  with open(path) as f:
+                      return {r['sample']: {k: float(v) for k,v in r.items() if k != 'sample'}
+                              for r in csv.DictReader(f)}
+
+              imp = load_csv(IMP_CSV)
+              syn = load_csv(SYN_CSV)
+              print(f"Improved CSV: {len(imp)} samples")
+              print(f"Synth-Aug CSV: {len(syn)} samples")
+
+              # Compute void sizes for all val cases
+              records = []
+              missing = 0
+              for case in val_cases:
+                  mask_path = os.path.join(DATA_ROOT, case, f'{case}-mask.nii.gz')
+                  if not os.path.exists(mask_path):
+                      missing += 1
+                      continue
+                  if case not in imp or case not in syn:
+                      print(f"  Missing in CSV: {case}")
+                      continue
+                  mask = nib.load(mask_path).get_fdata(dtype=np.float32)
+                  void_vox = int(mask.sum())
+                  records.append({
+                      'sample':   case,
+                      'void_vox': void_vox,
+                      'imp_ssim': imp[case]['ssim'],
+                      'imp_psnr': imp[case]['psnr'],
+                      'imp_mse':  imp[case]['mse'],
+                      'syn_ssim': syn[case]['ssim'],
+                      'syn_psnr': syn[case]['psnr'],
+                      'syn_mse':  syn[case]['mse'],
+                  })
+
+              print(f"Records with data: {len(records)}  (missing masks: {missing})")
+
+              # Sort by void size and compute quartile boundaries
+              records.sort(key=lambda r: r['void_vox'])
+              N = len(records)
+              q_bounds = [0, N//4, N//2, 3*N//4, N]
+              q_labels = ['Q1 (small)', 'Q2', 'Q3', 'Q4 (large)']
+
+              print(f"\n{'Quartile':<14} {'N':>4}  {'Void vox range':>22}  "
+                    f"{'Imp SSIM':>9}  {'Syn SSIM':>9}  {'ΔSSIM':>7}  "
+                    f"{'Imp MSE':>9}  {'Syn MSE':>9}  {'ΔMSE':>7}")
+              print('-' * 110)
+
+              table = []
+              for qi in range(4):
+                  chunk = records[q_bounds[qi]:q_bounds[qi+1]]
+                  vox_min = chunk[0]['void_vox']
+                  vox_max = chunk[-1]['void_vox']
+
+                  imp_ssim = np.mean([r['imp_ssim'] for r in chunk])
+                  syn_ssim = np.mean([r['syn_ssim'] for r in chunk])
+                  imp_psnr = np.mean([r['imp_psnr'] for r in chunk])
+                  syn_psnr = np.mean([r['syn_psnr'] for r in chunk])
+                  imp_mse  = np.mean([r['imp_mse']  for r in chunk])
+                  syn_mse  = np.mean([r['syn_mse']  for r in chunk])
+
+                  row = {
+                      'quartile': q_labels[qi],
+                      'n': len(chunk),
+                      'void_vox_min': vox_min,
+                      'void_vox_max': vox_max,
+                      'imp_ssim': round(imp_ssim, 4),
+                      'syn_ssim': round(syn_ssim, 4),
+                      'delta_ssim': round(syn_ssim - imp_ssim, 4),
+                      'imp_psnr': round(imp_psnr, 3),
+                      'syn_psnr': round(syn_psnr, 3),
+                      'delta_psnr': round(syn_psnr - imp_psnr, 3),
+                      'imp_mse': round(imp_mse, 5),
+                      'syn_mse': round(syn_mse, 5),
+                      'delta_mse': round(syn_mse - imp_mse, 5),
+                  }
+                  table.append(row)
+
+                  print(f"{q_labels[qi]:<14} {len(chunk):>4}  "
+                        f"{vox_min:>10,}–{vox_max:>10,}  "
+                        f"{imp_ssim:>9.4f}  {syn_ssim:>9.4f}  {syn_ssim-imp_ssim:>+7.4f}  "
+                        f"{imp_mse:>9.5f}  {syn_mse:>9.5f}  {syn_mse-imp_mse:>+7.5f}")
+
+              # Overall
+              imp_ssim_all = np.mean([r['imp_ssim'] for r in records])
+              syn_ssim_all = np.mean([r['syn_ssim'] for r in records])
+              imp_mse_all  = np.mean([r['imp_mse']  for r in records])
+              syn_mse_all  = np.mean([r['syn_mse']  for r in records])
+              print('-' * 110)
+              print(f"{'Overall':<14} {N:>4}  {'':>22}  "
+                    f"{imp_ssim_all:>9.4f}  {syn_ssim_all:>9.4f}  {syn_ssim_all-imp_ssim_all:>+7.4f}  "
+                    f"{imp_mse_all:>9.5f}  {syn_mse_all:>9.5f}  {syn_mse_all-imp_mse_all:>+7.5f}")
+
+              # Save
+              out_json = os.path.join(OUT_DIR, 'stratification.json')
+              with open(out_json, 'w') as f:
+                  json.dump({'quartiles': table, 'n_total': N}, f, indent=2)
+
+              out_csv = os.path.join(OUT_DIR, 'stratification.csv')
+              with open(out_csv, 'w', newline='') as f:
+                  w = csv.DictWriter(f, fieldnames=table[0].keys())
+                  w.writeheader()
+                  w.writerows(table)
+
+              print(f"\nSaved → {out_json}")
+              print(f"Saved → {out_csv}")
+              PYEOF
+              echo "=== Done ==="
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "4800Mi"
+              cpu: "2400m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: brats-inpainting-pvc
