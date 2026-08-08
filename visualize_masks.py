@@ -30,14 +30,7 @@ try:
 except ImportError as e:
     sys.exit(f"Missing dependency: {e}\n  pip install nibabel matplotlib")
 
-from synth_aug import generate_synth_mask_seeded
-
-
-def generate_synth_mask_seeded(real_mask, brain_mask, n_ellipsoids, seed):
-    """Wrapper with fixed seed for reproducible visualisation."""
-    from synth_aug import generate_synthetic_mask
-    rng = np.random.default_rng(seed)
-    return generate_synthetic_mask(brain_mask, rng=rng, n_ellipsoids=n_ellipsoids)
+from synth_aug import generate_synthetic_mask
 
 
 def load_case(data_dir, case):
@@ -79,8 +72,6 @@ def make_figure(data_dir, cases, out_path, dpi=200):
         "Synth-Aug Void\n(1–3 ellipsoids)",
     ]
     row_labels = ["Small void", "Medium void", "Large void"]
-
-    from synth_aug import generate_synthetic_mask
 
     fig, axes = plt.subplots(3, 4, figsize=(12.0, 9.5), dpi=dpi)
     fig.patch.set_facecolor("white")

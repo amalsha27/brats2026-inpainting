@@ -1,0 +1,202 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: brats-eval-cwdm-local-v2
+  namespace: gai-lina-group
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+
+      containers:
+        - name: eval
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              LOG=/data/experiments/cwdm-inpaint/eval_local.log
+              exec > >(tee -a $LOG) 2>&1
+
+              echo "=== $(date) | GPU ==="
+              nvidia-smi | head -10
+
+              echo "=== Installing dependencies ==="
+              pip install -q nibabel blobfile scikit-learn tqdm scikit-image wandb
+
+              echo "=== Cloning fast-cwdm repo ==="
+              git clone https://github.com/tsereda/fast-cwdm.git /tmp/fast-cwdm
+
+              echo "=== Copying inference script ==="
+              cp /data/code/infer_cwdm_inpaint.py /tmp/fast-cwdm/infer_cwdm_inpaint.py
+
+              # ── Build local-val directory from val_samples.json ─────────────
+              echo "=== Building local val directory ==="
+              python3 - <<'PYEOF'
+              import json, os, shutil
+
+              with open('/data/experiments/improved/val_samples.json') as f:
+                  split = json.load(f)
+              val_cases = split['val_samples']
+              train_root = '/data/brats2023/training'
+              val_dir    = '/tmp/cwdm-local-val'
+              os.makedirs(val_dir, exist_ok=True)
+
+              found, missing = 0, []
+              for case in val_cases:
+                  src = os.path.join(train_root, case)
+                  dst = os.path.join(val_dir, case)
+                  if not os.path.isdir(src):
+                      missing.append(case)
+                      continue
+                  os.makedirs(dst, exist_ok=True)
+                  for fname in os.listdir(src):
+                      s = os.path.join(src, fname)
+                      d = os.path.join(dst, fname)
+                      if not os.path.exists(d):
+                          os.symlink(s, d)
+                  found += 1
+
+              print(f'Val dir ready: {found} cases  |  missing: {len(missing)}')
+              if missing:
+                  print('  Missing:', missing[:5])
+              PYEOF
+
+              echo "=== Running CWDM inference on local val split (DDIM 50 steps) ==="
+              python /tmp/fast-cwdm/infer_cwdm_inpaint.py \
+                --checkpoint /data/experiments/cwdm-inpaint/best_model_cwdm_inpaint.pt \
+                --val_dir    /tmp/cwdm-local-val \
+                --output_dir /data/experiments/cwdm-inpaint/local-eval \
+                --repo_dir   /tmp/fast-cwdm \
+                --ddim_steps 50
+
+              echo "=== Computing metrics ==="
+              python3 - <<'PYEOF'
+              import os, json, math
+              import numpy as np
+              import nibabel as nib
+              from skimage.metrics import structural_similarity
+
+              train_root = '/data/brats2023/training'
+              pred_dir   = '/data/experiments/cwdm-inpaint/local-eval/ASNR-MICCAI-BraTS2023-Local-Synthesis-Challenge-Validation-Results'
+              out_dir    = '/data/experiments/cwdm-inpaint/local-eval'
+
+              def load(path):
+                  return nib.load(path).get_fdata(dtype=np.float32)
+
+              def norm(vol):
+                  nz = vol[vol > 0]
+                  if len(nz) < 100:
+                      return vol
+                  lo, hi = np.percentile(nz, 1), np.percentile(nz, 99)
+                  return np.clip((vol - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+              def compute(pred, target, mask):
+                  m = mask > 0
+                  if not m.any():
+                      return None
+                  mse  = float(np.mean((pred[m] - target[m]) ** 2))
+                  psnr = float(10 * math.log10(1.0 / (mse + 1e-10)))
+                  coords = np.argwhere(m)
+                  d0,h0,w0 = coords.min(axis=0)
+                  d1,h1,w1 = coords.max(axis=0)+1
+                  pad = 8
+                  D,H,W = pred.shape
+                  d0,h0,w0 = max(0,d0-pad),max(0,h0-pad),max(0,w0-pad)
+                  d1,h1,w1 = min(D,d1+pad),min(H,h1+pad),min(W,w1+pad)
+                  ssim = float(structural_similarity(
+                      target[d0:d1,h0:h1,w0:w1],
+                      pred  [d0:d1,h0:h1,w0:w1], data_range=1.0))
+                  return {'ssim': ssim, 'psnr': psnr, 'mse': mse}
+
+              results = []
+              pred_files = sorted([f for f in os.listdir(pred_dir) if f.endswith('.nii.gz')])
+              print(f'Computing metrics for {len(pred_files)} predictions...')
+
+              for fname in pred_files:
+                  # fname: BraTS-GLI-XXXXX-YYY-t1n-inference.nii.gz
+                  case = fname.replace('-t1n-inference.nii.gz', '')
+                  case_dir = os.path.join(train_root, case)
+
+                  target_f = os.path.join(case_dir, f'{case}-t1n.nii.gz')
+                  mask_f   = os.path.join(case_dir, f'{case}-mask.nii.gz')
+                  pred_f   = os.path.join(pred_dir, fname)
+
+                  if not os.path.exists(target_f) or not os.path.exists(mask_f):
+                      print(f'  SKIP {case}: missing ground truth or mask')
+                      continue
+
+                  pred   = norm(load(pred_f))
+                  target = norm(load(target_f))
+                  mask   = load(mask_f)
+
+                  m = compute(pred, target, mask)
+                  if m:
+                      m['case'] = case
+                      results.append(m)
+                      print(f'  {case}: SSIM={m["ssim"]:.4f}  PSNR={m["psnr"]:.2f}  MSE={m["mse"]:.6f}')
+
+              if results:
+                  ssims = [r['ssim'] for r in results]
+                  psnrs = [r['psnr'] for r in results]
+                  mses  = [r['mse']  for r in results]
+                  summary = {
+                      'model': 'cwdm-inpaint (local val)',
+                      'n': len(results),
+                      'ddim_steps': 50,
+                      'ssim': {'mean': float(np.mean(ssims)), 'std': float(np.std(ssims))},
+                      'psnr': {'mean': float(np.mean(psnrs)), 'std': float(np.std(psnrs))},
+                      'mse':  {'mean': float(np.mean(mses)),  'std': float(np.std(mses))},
+                  }
+                  print('\n' + '='*60)
+                  print(f"  Model  : Fast-CWDM (local val, {summary['n']} cases)")
+                  print(f"  SSIM   : {summary['ssim']['mean']:.4f} ± {summary['ssim']['std']:.4f}")
+                  print(f"  PSNR   : {summary['psnr']['mean']:.2f} ± {summary['psnr']['std']:.2f} dB")
+                  print(f"  MSE    : {summary['mse']['mean']:.6f} ± {summary['mse']['std']:.6f}")
+                  print('='*60)
+
+                  with open(os.path.join(out_dir, 'local_val_summary.json'), 'w') as f:
+                      json.dump(summary, f, indent=2)
+                  print(f"\nSaved → {out_dir}/local_val_summary.json")
+              else:
+                  print('No results computed.')
+              PYEOF
+
+              echo "=== Done: $(date) ==="
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: brats-inpainting-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
