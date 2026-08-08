@@ -1,0 +1,176 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: brats-figures-v1
+  namespace: gai-lina-group
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fig
+          image: python:3.10-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              pip install -q nibabel matplotlib numpy
+
+              python3 << 'PYEOF'
+              import os, json
+              import numpy as np
+              import nibabel as nib
+              import matplotlib
+              matplotlib.use('Agg')
+              import matplotlib.pyplot as plt
+
+              DATA_ROOT = '/data/brats2023/training'
+              EXPS_ROOT = '/data/experiments'
+              VAL_JSON  = '/data/experiments/improved/val_samples.json'
+              OUT_DIR   = '/data/experiments/figures'
+              os.makedirs(OUT_DIR, exist_ok=True)
+
+              PRED_SUFFIX = 'ASNR-MICCAI-BraTS2023-Local-Synthesis-Challenge-Validation-Results'
+
+              # ── Discover prediction directories ──────────────────────────────
+              print("=== Scanning /data/experiments/ ===")
+              model_dirs = {}
+              for root, dirs, files in os.walk(EXPS_ROOT):
+                  if os.path.basename(root) == PRED_SUFFIX:
+                      preds = [f for f in os.listdir(root) if f.endswith('.nii.gz')]
+                      if len(preds) >= 10:
+                          parent = os.path.relpath(os.path.dirname(root), EXPS_ROOT)
+                          model_dirs[parent] = (root, len(preds))
+                          print(f"  [{len(preds):3d} preds]  {parent}")
+
+              # ── Choose Synth-Aug and Fast-CWDM ───────────────────────────────
+              DISPLAY = {}
+              for name, (path, n) in model_dirs.items():
+                  nl = name.lower()
+                  if 'cwdm' in nl and 'local' in nl:
+                      DISPLAY['Fast-CWDM'] = path
+                  elif any(k in nl for k in ['synthaug','synth_aug','synth-aug']):
+                      DISPLAY['Synth-Aug'] = path
+                  elif 'improved' in nl and 'synth' not in nl:
+                      DISPLAY.setdefault('Improved U-Net', path)
+
+              # fallback: take first two found
+              if not DISPLAY:
+                  items = list(model_dirs.items())
+                  for i, (n, (p, _)) in enumerate(items[:2]):
+                      DISPLAY[n] = p
+
+              print(f"\nUsing: {list(DISPLAY.keys())}")
+
+              # ── Load val split ────────────────────────────────────────────────
+              with open(VAL_JSON) as f:
+                  val_cases = json.load(f)['val_samples']
+
+              def load(path):
+                  return nib.load(path).get_fdata(dtype=np.float32)
+
+              def norm(vol, mask=None):
+                  src = vol[mask > 0.5] if mask is not None else vol[vol > 0]
+                  if len(src) < 100:
+                      return np.clip(vol / (vol.max() + 1e-8), 0, 1)
+                  lo, hi = np.percentile(src, 1), np.percentile(src, 99)
+                  return np.clip((vol - lo) / (hi - lo + 1e-8), 0, 1)
+
+              def best_axial(mask_vol):
+                  return int(np.argmax(mask_vol.sum(axis=(0, 1))))
+
+              # ── Pick 3 cases: small / medium / large void ─────────────────────
+              cases_info = []
+              for case in val_cases:
+                  mpath = os.path.join(DATA_ROOT, case, f'{case}-mask.nii.gz')
+                  gpath = os.path.join(DATA_ROOT, case, f'{case}-t1n.nii.gz')
+                  vpath = os.path.join(DATA_ROOT, case, f'{case}-t1n-voided.nii.gz')
+                  if not all(os.path.exists(p) for p in [mpath, gpath, vpath]):
+                      continue
+                  mask = load(mpath)
+                  cases_info.append((case, int(mask.sum()), gpath, mpath, vpath))
+
+              cases_info.sort(key=lambda x: x[1])
+              N = len(cases_info)
+              picks = [cases_info[N // 6], cases_info[N // 2], cases_info[5 * N // 6]]
+              print(f"Cases: {[p[0] for p in picks]}")
+              print(f"Void sizes: {[p[1] for p in picks]}")
+
+              # ── Build figure ──────────────────────────────────────────────────
+              n_cols = 3 + len(DISPLAY)
+              n_rows = len(picks)
+              col_labels = ['Voided Input', 'Void Mask', 'Ground Truth'] + list(DISPLAY.keys())
+
+              fig, axes = plt.subplots(n_rows, n_cols,
+                                       figsize=(2.6 * n_cols, 2.8 * n_rows),
+                                       dpi=200)
+              if n_rows == 1:
+                  axes = axes[np.newaxis, :]
+
+              fig.patch.set_facecolor('white')
+
+              for col_idx, label in enumerate(col_labels):
+                  axes[0, col_idx].set_title(label, fontsize=9, fontweight='bold', pad=5)
+
+              for row_idx, (case, _, gpath, mpath, vpath) in enumerate(picks):
+                  voided = norm(load(vpath))
+                  mask   = load(mpath)
+                  gt     = norm(load(gpath))
+                  sl     = best_axial(mask)
+
+                  def show(ax, img, cmap='gray', vmin=0, vmax=1):
+                      ax.imshow(np.rot90(img[:, :, sl]), cmap=cmap,
+                                vmin=vmin, vmax=vmax, interpolation='bilinear')
+                      ax.set_xticks([]); ax.set_yticks([])
+                      for spine in ax.spines.values():
+                          spine.set_visible(False)
+
+                  show(axes[row_idx, 0], voided)
+                  show(axes[row_idx, 1], mask, cmap='hot')
+                  show(axes[row_idx, 2], gt)
+
+                  for m_idx, (mname, mdir) in enumerate(DISPLAY.items()):
+                      pred_path = os.path.join(mdir, f'{case}-t1n-inference.nii.gz')
+                      col = 3 + m_idx
+                      if os.path.exists(pred_path):
+                          pred = norm(load(pred_path))
+                          show(axes[row_idx, col], pred)
+                      else:
+                          axes[row_idx, col].set_facecolor('#111111')
+                          axes[row_idx, col].text(0.5, 0.5, 'N/A', ha='center', va='center',
+                              transform=axes[row_idx, col].transAxes,
+                              fontsize=9, color='white')
+                          axes[row_idx, col].set_xticks([]); axes[row_idx, col].set_yticks([])
+                      print(f"  {mname} {case}: {'OK' if os.path.exists(pred_path) else 'MISSING'}")
+
+                  # row size label
+                  sizes = ['Small void', 'Medium void', 'Large void']
+                  axes[row_idx, 0].set_ylabel(sizes[row_idx], fontsize=8, labelpad=4)
+
+              plt.suptitle('BraTS 2026 Task 4: T1n Inpainting — Local Validation Results',
+                           fontsize=11, fontweight='bold', y=1.01)
+              plt.tight_layout(pad=0.4, h_pad=0.5, w_pad=0.3)
+
+              out = os.path.join(OUT_DIR, 'inpainting_comparison.png')
+              plt.savefig(out, dpi=200, bbox_inches='tight', facecolor='white')
+              print(f"\nSaved → {out}")
+              PYEOF
+
+              echo "=== Done ==="
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "16Gi"
+              cpu: "4"
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: brats-inpainting-pvc
