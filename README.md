@@ -30,7 +30,11 @@ Each ellipsoid has:
 | `synth_aug.py` | Standalone augmentation implementation (NumPy + optional PyTorch) |
 | `visualize_masks.py` | Generate the mask comparison figure |
 | `requirements.txt` | Python dependencies |
-| `nautilus/` | Kubernetes job YAMLs for training and evaluation on NRP Nautilus |
+| `nautilus/scripts/` | Python training, evaluation, and inference scripts (train.py, evaluate.py, infer.py, etc.) |
+| `nautilus/jobs/training/` | Kubernetes job YAMLs for training each model (U-Net, Improved U-Net, SwinUNETR, Synth-Aug, Symmetry, Fast-CWDM) |
+| `nautilus/jobs/evaluation/` | Evaluation jobs — per-sample SSIM/PSNR/MSE on local validation set, stratification analysis |
+| `nautilus/jobs/inference/` | Inference jobs for generating Synapse submission predictions |
+| `nautilus/jobs/visualization/` | Figure generation jobs |
 
 ## Quick start
 
