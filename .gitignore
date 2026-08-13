@@ -10,5 +10,3 @@ build/
 .env
 *.log
 .DS_Store
-scripts/
-scripts/
